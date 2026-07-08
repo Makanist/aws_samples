@@ -294,12 +294,16 @@ def build_coverage_rows(tagged_services, config_types, covered_types, service_to
         recorded = "Yes" if key in config_services_norm else "No"
         scanned = "Yes" if key in covered_services else "No"
         standards = sorted(service_to_standards.get(key, []))
-        if scanned == "Yes" and not standards:
-            standards_str = "Unknown (active control found, standard couldn't be confidently attributed)"
+        if scanned != "Yes":
+            # Not actively scanned -> no standard is actually covering it, even
+            # if that service has an ENABLED control somewhere (e.g. a
+            # different resource type under the same service that isn't the
+            # one you have, or one whose Config rule doesn't scope this type).
+            standards_str = ""
         elif standards:
             standards_str = ", ".join(standards)
         else:
-            standards_str = ""
+            standards_str = "Unknown (active control found, standard couldn't be confidently attributed)"
         gap_category = classify_gap(recorded, scanned, key, all_supported_services)
         rows.append([svc, tagged_count, recorded, cfg_count, scanned, standards_str, gap_category])
     return rows
