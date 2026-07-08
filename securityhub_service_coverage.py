@@ -244,6 +244,28 @@ def normalize(svc):
     return svc.lower().replace("-", "").replace("_", "")
 
 
+# AWS Config resource types and Security Hub control IDs sometimes use
+# different names for the same real-world service. Config/tag-derived service
+# name (normalized) -> the control-ID-prefix name (normalized) it should be
+# looked up under when attributing standard coverage. Add to this table if you
+# spot more "Unknown" rows that are really just a naming mismatch.
+CONFIG_TO_CONTROL_ALIAS = {
+    "elasticloadbalancing": "elb",          # classic ELB -> ELB.* controls
+    "elasticloadbalancingv2": "elb",        # ALB/NLB -> ELB.* controls
+    "events": "eventbridge",                # AWS::Events::* -> EventBridge.* controls
+    "wafv2": "waf",                         # AWS::WAFv2::* -> WAF.* controls
+    "wafregional": "waf",                   # AWS::WAFRegional::* -> WAF.* controls
+    "kinesisfirehose": "datafirehose",      # AWS::KinesisFirehose::* -> DataFirehose.* controls
+    "firehose": "datafirehose",             # ARN service name "firehose" -> DataFirehose.* controls
+}
+
+
+def control_lookup_key(config_domain_key):
+    """Map a Config/tag-derived service key to the key it'd appear under in
+    the control-ID-derived mapping, via the known alias table above."""
+    return CONFIG_TO_CONTROL_ALIAS.get(config_domain_key, config_domain_key)
+
+
 def build_service_to_standards(all_controls_by_standard):
     """
     all_controls_by_standard: list of (standard_name, control_id, status)
@@ -289,11 +311,12 @@ def build_coverage_rows(tagged_services, config_types, covered_types, service_to
     rows = []
     for svc in all_services:
         key = normalize(svc)
+        lookup_key = control_lookup_key(key)
         tagged_count = tagged_services.get(svc, "")
         cfg_count = config_service_counts.get(svc, "")
         recorded = "Yes" if key in config_services_norm else "No"
         scanned = "Yes" if key in covered_services else "No"
-        standards = sorted(service_to_standards.get(key, []))
+        standards = sorted(service_to_standards.get(lookup_key, []))
         if scanned != "Yes":
             # Not actively scanned -> no standard is actually covering it, even
             # if that service has an ENABLED control somewhere (e.g. a
@@ -304,7 +327,7 @@ def build_coverage_rows(tagged_services, config_types, covered_types, service_to
             standards_str = ", ".join(standards)
         else:
             standards_str = "Unknown (active control found, standard couldn't be confidently attributed)"
-        gap_category = classify_gap(recorded, scanned, key, all_supported_services)
+        gap_category = classify_gap(recorded, scanned, lookup_key, all_supported_services)
         rows.append([svc, tagged_count, recorded, cfg_count, scanned, standards_str, gap_category])
     return rows
 
