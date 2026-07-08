@@ -59,22 +59,42 @@ regardless of which standards are enabled):
                                          the specific control is disabled.
                                          This is the actionable bucket.
 
-For every service that isn't actively scanned, an additional "Available Via
-Standard(s) Not Yet Enabled" column lists which of Security Hub's standards
-(beyond what you already have enabled) would actually give you a control for
-that service, using ListStandardsControlAssociations -- so your security team
-can see exactly which standard to turn on, per service, instead of guessing.
-Blank means no additional standard would help (either already scanned, or no
-standard anywhere has a control for it).
+For rows specifically classified as "Control exists but not active in your
+account", an additional column -- "Standard(s) With This Control Enabled" --
+lists every standard (via ListStandardsControlAssociations) that has an
+ENABLED association for a control on that service, whether or not you've
+enabled that standard yourself. Each entry is tagged:
+    "<Standard> (not enabled)"                       -- turning this standard
+                                                         on would give you
+                                                         this control.
+    "<Standard> (already enabled -- control is
+     disabled)"                                       -- you already have
+                                                         this standard on;
+                                                         the specific control
+                                                         was disabled
+                                                         (manually, or by
+                                                         default for newly
+                                                         released controls) --
+                                                         re-enable the control
+                                                         itself, not the
+                                                         standard.
+This column is intentionally left blank for every other row (already
+scanned, not recorded by Config, or no control exists anywhere for that
+service) since a standard recommendation isn't meaningful there.
 
 Usage:
     pip install boto3 --break-system-packages   # if not already installed
     python3 securityhub_service_coverage.py --profile myprofile --region us-east-1 \
         --output securityhub_service_coverage.csv
 
-Note: this script now makes one API call per control in Security Hub's full
-catalog (~200-300 calls) to build the standard-availability column. Expect
-the run to take noticeably longer than earlier versions of this script.
+Performance note: building the standard-availability column needs one API call
+per relevant control (ListStandardsControlAssociations has no bulk form for
+"all standards for this control"). Two things keep this fast:
+  - Only controls belonging to services you actually have are queried, not
+    Security Hub's entire catalog (skip --no-filter-controls to disable this
+    and check every control regardless of relevance).
+  - Those calls run concurrently via a thread pool (--workers, default 20).
+Use --workers 1 to fall back to fully sequential calls if you hit throttling.
 
 Required IAM permissions (read-only):
     tag:GetResources
@@ -91,7 +111,10 @@ Required IAM permissions (read-only):
 import argparse
 import csv
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+
+from botocore.config import Config as BotoConfig
 
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
@@ -238,18 +261,28 @@ def get_all_control_ids(session):
     return control_ids
 
 
-def get_control_standard_availability(session, control_ids, name_map):
+def get_control_standard_availability(session, control_ids, name_map, max_workers=20):
     """
-    For every control in the full catalog, find every standard (enabled or
-    not) that includes it with AssociationStatus == 'ENABLED' -- i.e. every
+    For every control in `control_ids`, find every standard (enabled or not)
+    that includes it with AssociationStatus == 'ENABLED' -- i.e. every
     standard where turning it on would actually give you this control. This
     powers the "you could get this by enabling standard X" recommendation.
-    One API call per control, so this is the slowest step for accounts with
-    a large control catalog (~200-300 calls); each call is cheap.
+
+    ListStandardsControlAssociations has no bulk form ("all standards for
+    this control" is one call per control), so this fans the calls out
+    across a thread pool instead of doing them one at a time -- these are
+    independent, read-only, network-bound calls, so concurrency is safe and
+    turns e.g. 300 sequential round-trips into ~300/max_workers.
     """
-    client = session.client("securityhub")
-    control_to_standards = {}
-    for cid in sorted(control_ids):
+    client = session.client(
+        "securityhub",
+        config=BotoConfig(
+            max_pool_connections=max(max_workers, 10),
+            retries={"max_attempts": 10, "mode": "adaptive"},
+        ),
+    )
+
+    def fetch_one(cid):
         standards_for_control = set()
         try:
             paginator = client.get_paginator("list_standards_control_associations")
@@ -260,7 +293,15 @@ def get_control_standard_availability(session, control_ids, name_map):
                         standards_for_control.add(name_map.get(arn, arn))
         except ClientError as e:
             print(f"  [warn] list_standards_control_associations failed for {cid}: {e}")
-        control_to_standards[cid] = standards_for_control
+        return cid, standards_for_control
+
+    control_to_standards = {}
+    workers = max(1, max_workers)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(fetch_one, cid) for cid in sorted(control_ids)]
+        for future in as_completed(futures):
+            cid, standards_for_control = future.result()
+            control_to_standards[cid] = standards_for_control
     return control_to_standards
 
 
@@ -390,11 +431,25 @@ def build_coverage_rows(
             standards_str = "Unknown (active control found, standard couldn't be confidently attributed)"
         gap_category = classify_gap(recorded, scanned, lookup_key, all_supported_services)
 
-        # Which standards -- enabled or not -- have a control for this service
-        # that you're not already benefiting from. Blank for services that
-        # are already actively scanned, or that have no control anywhere.
-        available = service_available_standards.get(lookup_key, set()) - enabled_set
-        available_str = ", ".join(sorted(available)) if (scanned != "Yes" and available) else ""
+        # Only populated for GAP_CONTROL_INACTIVE rows, per request -- blank
+        # everywhere else (already scanned, not recorded, or no control exists
+        # at all). Deliberately NOT subtracting your already-enabled standards
+        # here: for this exact category, the responsible standard is often
+        # already enabled and it's the specific control that's disabled, so
+        # subtracting enabled standards was hiding the very answer being asked
+        # for. Each standard is tagged so it's clear whether the fix is
+        # "enable this standard" or "re-enable this control under a standard
+        # you already have on."
+        available_str = ""
+        if gap_category == GAP_CONTROL_INACTIVE:
+            avail = service_available_standards.get(lookup_key, set())
+            labeled = []
+            for name in sorted(avail):
+                if name in enabled_set:
+                    labeled.append(f"{name} (already enabled -- control is disabled)")
+                else:
+                    labeled.append(f"{name} (not enabled)")
+            available_str = "; ".join(labeled)
 
         rows.append([svc, tagged_count, recorded, cfg_count, scanned, standards_str, gap_category, available_str])
     return rows
@@ -408,7 +463,7 @@ CSV_HEADERS = [
     "Actively Scanned by Security Hub?",
     "Covering Standard(s)",
     "Gap Category",
-    "Available Via Standard(s) Not Yet Enabled",
+    "Standard(s) With This Control Enabled (only for 'Control exists but not active' rows)",
 ]
 
 
@@ -428,6 +483,12 @@ def main():
     parser.add_argument("--profile", default=None, help="AWS named profile to use")
     parser.add_argument("--region", default=None, help="AWS region to inspect")
     parser.add_argument("--output", default="securityhub_service_coverage.csv", help="Output .csv path")
+    parser.add_argument("--workers", type=int, default=20,
+                         help="Concurrent threads for the standard-availability lookup (default 20). "
+                              "Use 1 to go fully sequential if you hit API throttling.")
+    parser.add_argument("--no-filter-controls", action="store_true",
+                         help="Check standard-availability for every control in Security Hub's catalog, "
+                              "not just services you actually have. Much slower; mainly for debugging.")
     args = parser.parse_args()
 
     try:
@@ -470,12 +531,29 @@ def main():
 
     print("5/7  Pulling full Security Hub control catalog (any standard, any enablement)...")
     all_control_ids = get_all_control_ids(session)
+    # Used for the "No Security Hub control exists" classification -- keep this
+    # against the FULL catalog regardless of filtering below, so that check
+    # stays accurate.
     all_supported_services = {normalize(service_from_control_id(cid)) for cid in all_control_ids}
 
-    print(f"6/7  Checking which standard(s) each of the {len(all_control_ids)} controls belongs to "
-          f"(one call per control -- this is the slow step)...")
-    control_to_standards = get_control_standard_availability(session, all_control_ids, name_map)
-    service_available_standards = build_service_available_standards(all_control_ids, control_to_standards)
+    if args.no_filter_controls:
+        controls_to_check = all_control_ids
+    else:
+        config_service_keys = {service_from_resource_type(rt) for rt in config_types}
+        relevant_services = {
+            control_lookup_key(normalize(s)) for s in (set(tagged_services) | config_service_keys)
+        }
+        controls_to_check = {
+            cid for cid in all_control_ids
+            if normalize(service_from_control_id(cid)) in relevant_services
+        }
+
+    print(f"6/7  Checking which standard(s) each of the {len(controls_to_check)} relevant controls "
+          f"(of {len(all_control_ids)} total) belongs to, using {args.workers} concurrent workers...")
+    control_to_standards = get_control_standard_availability(
+        session, controls_to_check, name_map, max_workers=args.workers
+    )
+    service_available_standards = build_service_available_standards(controls_to_check, control_to_standards)
 
     print("7/7  Building coverage table and writing CSV...")
     service_to_standards = build_service_to_standards(all_controls_by_standard)
