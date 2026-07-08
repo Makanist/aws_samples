@@ -36,6 +36,29 @@ How "covered" is determined (two independent signals, combined):
      securityhub_gap_report.py if you need control-level precision instead of
      service-level.
 
+For every unscanned service, a "Gap Category" column classifies *why* it's
+unscanned, using Security Hub's full control catalog (list_security_control_
+definitions, which lists every control the service supports in this region,
+regardless of which standards are enabled):
+
+    Not recorded by AWS Config       -- Config isn't tracking this service at
+                                         all; Security Hub can never scan it
+                                         under any standard until that changes.
+    No Security Hub control exists   -- Config records it fine, but Security
+                                         Hub has zero controls for this
+                                         service in this region, for any
+                                         standard. Enabling more standards
+                                         won't fix this -- it's a structural
+                                         ceiling in what Security Hub checks
+                                         today.
+    Control exists but not active    -- Security Hub does have at least one
+                                         control for this service somewhere,
+                                         but none of it is currently active in
+                                         your account -- either the standard
+                                         that contains it isn't enabled, or
+                                         the specific control is disabled.
+                                         This is the actionable bucket.
+
 Usage:
     pip install boto3 --break-system-packages   # if not already installed
     python3 securityhub_service_coverage.py --profile myprofile --region us-east-1 \
@@ -48,6 +71,7 @@ Required IAM permissions (read-only):
     securityhub:GetEnabledStandards
     securityhub:DescribeStandards
     securityhub:DescribeStandardsControls
+    securityhub:ListSecurityControlDefinitions
     sts:GetCallerIdentity
 """
 
@@ -180,6 +204,27 @@ def get_controls_for_standard(session, subscription_arn):
     return controls
 
 
+def get_all_control_ids(session):
+    """
+    Every SecurityControlId Security Hub supports in this region, regardless
+    of which standards are enabled -- the full control catalog. Used to tell
+    apart "no standard you've enabled covers this" from "Security Hub simply
+    has no control for this, ever."
+    """
+    client = session.client("securityhub")
+    control_ids = set()
+    try:
+        paginator = client.get_paginator("list_security_control_definitions")
+        for page in paginator.paginate():
+            for defn in page.get("SecurityControlDefinitions", []):
+                cid = defn.get("SecurityControlId")
+                if cid:
+                    control_ids.add(cid)
+    except ClientError as e:
+        print(f"  [warn] Security Hub list_security_control_definitions failed: {e}")
+    return control_ids
+
+
 # --------------------------------------------------------------------------
 # Business logic
 # --------------------------------------------------------------------------
@@ -214,7 +259,23 @@ def build_service_to_standards(all_controls_by_standard):
     return mapping
 
 
-def build_coverage_rows(tagged_services, config_types, covered_types, service_to_standards):
+GAP_NOT_RECORDED = "Not recorded by AWS Config"
+GAP_NO_CONTROL_EXISTS = "No Security Hub control exists (any standard)"
+GAP_CONTROL_INACTIVE = "Control exists but not active in your account"
+GAP_NONE = ""  # actively scanned -- not a gap
+
+
+def classify_gap(recorded, scanned, key, all_supported_services):
+    if scanned == "Yes":
+        return GAP_NONE
+    if recorded == "No":
+        return GAP_NOT_RECORDED
+    if key not in all_supported_services:
+        return GAP_NO_CONTROL_EXISTS
+    return GAP_CONTROL_INACTIVE
+
+
+def build_coverage_rows(tagged_services, config_types, covered_types, service_to_standards, all_supported_services):
     config_service_counts = {}
     for rt, count in config_types.items():
         svc = service_from_resource_type(rt)
@@ -239,7 +300,8 @@ def build_coverage_rows(tagged_services, config_types, covered_types, service_to
             standards_str = ", ".join(standards)
         else:
             standards_str = ""
-        rows.append([svc, tagged_count, recorded, cfg_count, scanned, standards_str])
+        gap_category = classify_gap(recorded, scanned, key, all_supported_services)
+        rows.append([svc, tagged_count, recorded, cfg_count, scanned, standards_str, gap_category])
     return rows
 
 
@@ -250,6 +312,7 @@ CSV_HEADERS = [
     "Config Discovered Count",
     "Actively Scanned by Security Hub?",
     "Covering Standard(s)",
+    "Gap Category",
 ]
 
 
@@ -287,16 +350,16 @@ def main():
 
     print(f"Account: {account_id}   Region: {region}")
 
-    print("1/5  Pulling tagged resource inventory (Resource Groups Tagging API)...")
+    print("1/6  Pulling tagged resource inventory (Resource Groups Tagging API)...")
     tagged_services = get_tagged_service_counts(session)
 
-    print("2/5  Pulling AWS Config discovered resource counts...")
+    print("2/6  Pulling AWS Config discovered resource counts...")
     config_types = get_config_discovered_resource_counts(session)
 
-    print("3/5  Reading live Security Hub Config rules (active scan scope)...")
+    print("3/6  Reading live Security Hub Config rules (active scan scope)...")
     covered_types = get_securityhub_active_resource_types(session)
 
-    print("4/5  Listing enabled standards and control status...")
+    print("4/6  Listing enabled standards and control status...")
     enabled_subs = get_enabled_standards(session)
     name_map = get_standards_name_map(session)
     all_controls_by_standard = []
@@ -309,15 +372,29 @@ def main():
         for c in get_controls_for_standard(session, sub_arn):
             all_controls_by_standard.append((name, c.get("ControlId", ""), c.get("ControlStatus", "UNKNOWN")))
 
-    print("5/5  Building coverage table and writing CSV...")
+    print("5/6  Pulling full Security Hub control catalog (any standard, any enablement)...")
+    all_control_ids = get_all_control_ids(session)
+    all_supported_services = {normalize(service_from_control_id(cid)) for cid in all_control_ids}
+
+    print("6/6  Building coverage table and writing CSV...")
     service_to_standards = build_service_to_standards(all_controls_by_standard)
-    rows = build_coverage_rows(tagged_services, config_types, covered_types, service_to_standards)
+    rows = build_coverage_rows(
+        tagged_services, config_types, covered_types, service_to_standards, all_supported_services
+    )
     write_csv(rows, args.output)
 
     covered_count = sum(1 for r in rows if r[4] == "Yes")
+    gap_counts = {}
+    for r in rows:
+        cat = r[6]
+        if cat:
+            gap_counts[cat] = gap_counts.get(cat, 0) + 1
+
     print(f"\nDone. {len(rows)} services written to: {args.output}")
     print(f"  Enabled standards: {', '.join(standard_names) or 'none detected'}")
     print(f"  Services actively scanned by Security Hub: {covered_count} / {len(rows)}")
+    for cat, count in sorted(gap_counts.items(), key=lambda x: -x[1]):
+        print(f"    - {cat}: {count}")
     if not enabled_subs:
         print("  NOTE: no Security Hub standards were detected as enabled in this region.")
 
