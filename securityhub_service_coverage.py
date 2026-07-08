@@ -59,10 +59,22 @@ regardless of which standards are enabled):
                                          the specific control is disabled.
                                          This is the actionable bucket.
 
+For every service that isn't actively scanned, an additional "Available Via
+Standard(s) Not Yet Enabled" column lists which of Security Hub's standards
+(beyond what you already have enabled) would actually give you a control for
+that service, using ListStandardsControlAssociations -- so your security team
+can see exactly which standard to turn on, per service, instead of guessing.
+Blank means no additional standard would help (either already scanned, or no
+standard anywhere has a control for it).
+
 Usage:
     pip install boto3 --break-system-packages   # if not already installed
     python3 securityhub_service_coverage.py --profile myprofile --region us-east-1 \
         --output securityhub_service_coverage.csv
+
+Note: this script now makes one API call per control in Security Hub's full
+catalog (~200-300 calls) to build the standard-availability column. Expect
+the run to take noticeably longer than earlier versions of this script.
 
 Required IAM permissions (read-only):
     tag:GetResources
@@ -72,6 +84,7 @@ Required IAM permissions (read-only):
     securityhub:DescribeStandards
     securityhub:DescribeStandardsControls
     securityhub:ListSecurityControlDefinitions
+    securityhub:ListStandardsControlAssociations
     sts:GetCallerIdentity
 """
 
@@ -225,6 +238,32 @@ def get_all_control_ids(session):
     return control_ids
 
 
+def get_control_standard_availability(session, control_ids, name_map):
+    """
+    For every control in the full catalog, find every standard (enabled or
+    not) that includes it with AssociationStatus == 'ENABLED' -- i.e. every
+    standard where turning it on would actually give you this control. This
+    powers the "you could get this by enabling standard X" recommendation.
+    One API call per control, so this is the slowest step for accounts with
+    a large control catalog (~200-300 calls); each call is cheap.
+    """
+    client = session.client("securityhub")
+    control_to_standards = {}
+    for cid in sorted(control_ids):
+        standards_for_control = set()
+        try:
+            paginator = client.get_paginator("list_standards_control_associations")
+            for page in paginator.paginate(SecurityControlId=cid):
+                for assoc in page.get("StandardsControlAssociationSummaries", []):
+                    if assoc.get("AssociationStatus") == "ENABLED":
+                        arn = assoc.get("StandardsArn")
+                        standards_for_control.add(name_map.get(arn, arn))
+        except ClientError as e:
+            print(f"  [warn] list_standards_control_associations failed for {cid}: {e}")
+        control_to_standards[cid] = standards_for_control
+    return control_to_standards
+
+
 # --------------------------------------------------------------------------
 # Business logic
 # --------------------------------------------------------------------------
@@ -281,6 +320,19 @@ def build_service_to_standards(all_controls_by_standard):
     return mapping
 
 
+def build_service_available_standards(all_control_ids, control_to_standards):
+    """
+    {normalized_service: set(standard_names)} for every standard that would
+    give you at least one control for that service if you enabled it --
+    regardless of whether you've enabled it already.
+    """
+    mapping = {}
+    for cid in all_control_ids:
+        svc = normalize(service_from_control_id(cid))
+        mapping.setdefault(svc, set()).update(control_to_standards.get(cid, set()))
+    return mapping
+
+
 GAP_NOT_RECORDED = "Not recorded by AWS Config"
 GAP_NO_CONTROL_EXISTS = "No Security Hub control exists (any standard)"
 GAP_CONTROL_INACTIVE = "Control exists but not active in your account"
@@ -297,7 +349,15 @@ def classify_gap(recorded, scanned, key, all_supported_services):
     return GAP_CONTROL_INACTIVE
 
 
-def build_coverage_rows(tagged_services, config_types, covered_types, service_to_standards, all_supported_services):
+def build_coverage_rows(
+    tagged_services,
+    config_types,
+    covered_types,
+    service_to_standards,
+    all_supported_services,
+    service_available_standards,
+    enabled_standard_names,
+):
     config_service_counts = {}
     for rt, count in config_types.items():
         svc = service_from_resource_type(rt)
@@ -305,6 +365,7 @@ def build_coverage_rows(tagged_services, config_types, covered_types, service_to
 
     covered_services = {normalize(service_from_resource_type(rt)) for rt in covered_types}
     config_services_norm = {normalize(s) for s in config_service_counts}
+    enabled_set = set(enabled_standard_names)
 
     all_services = sorted(set(tagged_services) | set(config_service_counts))
 
@@ -328,7 +389,14 @@ def build_coverage_rows(tagged_services, config_types, covered_types, service_to
         else:
             standards_str = "Unknown (active control found, standard couldn't be confidently attributed)"
         gap_category = classify_gap(recorded, scanned, lookup_key, all_supported_services)
-        rows.append([svc, tagged_count, recorded, cfg_count, scanned, standards_str, gap_category])
+
+        # Which standards -- enabled or not -- have a control for this service
+        # that you're not already benefiting from. Blank for services that
+        # are already actively scanned, or that have no control anywhere.
+        available = service_available_standards.get(lookup_key, set()) - enabled_set
+        available_str = ", ".join(sorted(available)) if (scanned != "Yes" and available) else ""
+
+        rows.append([svc, tagged_count, recorded, cfg_count, scanned, standards_str, gap_category, available_str])
     return rows
 
 
@@ -340,6 +408,7 @@ CSV_HEADERS = [
     "Actively Scanned by Security Hub?",
     "Covering Standard(s)",
     "Gap Category",
+    "Available Via Standard(s) Not Yet Enabled",
 ]
 
 
@@ -377,16 +446,16 @@ def main():
 
     print(f"Account: {account_id}   Region: {region}")
 
-    print("1/6  Pulling tagged resource inventory (Resource Groups Tagging API)...")
+    print("1/7  Pulling tagged resource inventory (Resource Groups Tagging API)...")
     tagged_services = get_tagged_service_counts(session)
 
-    print("2/6  Pulling AWS Config discovered resource counts...")
+    print("2/7  Pulling AWS Config discovered resource counts...")
     config_types = get_config_discovered_resource_counts(session)
 
-    print("3/6  Reading live Security Hub Config rules (active scan scope)...")
+    print("3/7  Reading live Security Hub Config rules (active scan scope)...")
     covered_types = get_securityhub_active_resource_types(session)
 
-    print("4/6  Listing enabled standards and control status...")
+    print("4/7  Listing enabled standards and control status...")
     enabled_subs = get_enabled_standards(session)
     name_map = get_standards_name_map(session)
     all_controls_by_standard = []
@@ -399,14 +468,25 @@ def main():
         for c in get_controls_for_standard(session, sub_arn):
             all_controls_by_standard.append((name, c.get("ControlId", ""), c.get("ControlStatus", "UNKNOWN")))
 
-    print("5/6  Pulling full Security Hub control catalog (any standard, any enablement)...")
+    print("5/7  Pulling full Security Hub control catalog (any standard, any enablement)...")
     all_control_ids = get_all_control_ids(session)
     all_supported_services = {normalize(service_from_control_id(cid)) for cid in all_control_ids}
 
-    print("6/6  Building coverage table and writing CSV...")
+    print(f"6/7  Checking which standard(s) each of the {len(all_control_ids)} controls belongs to "
+          f"(one call per control -- this is the slow step)...")
+    control_to_standards = get_control_standard_availability(session, all_control_ids, name_map)
+    service_available_standards = build_service_available_standards(all_control_ids, control_to_standards)
+
+    print("7/7  Building coverage table and writing CSV...")
     service_to_standards = build_service_to_standards(all_controls_by_standard)
     rows = build_coverage_rows(
-        tagged_services, config_types, covered_types, service_to_standards, all_supported_services
+        tagged_services,
+        config_types,
+        covered_types,
+        service_to_standards,
+        all_supported_services,
+        service_available_standards,
+        standard_names,
     )
     write_csv(rows, args.output)
 
