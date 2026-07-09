@@ -443,13 +443,20 @@ def build_coverage_rows(
         available_str = ""
         if gap_category == GAP_CONTROL_INACTIVE:
             avail = service_available_standards.get(lookup_key, set())
-            labeled = []
-            for name in sorted(avail):
-                if name in enabled_set:
-                    labeled.append(f"{name} (already enabled -- control is disabled)")
-                else:
-                    labeled.append(f"{name} (not enabled)")
-            available_str = "; ".join(labeled)
+            if avail:
+                labeled = []
+                for name in sorted(avail):
+                    if name in enabled_set:
+                        labeled.append(f"{name} (already enabled -- control is disabled)")
+                    else:
+                        labeled.append(f"{name} (not enabled)")
+                available_str = "; ".join(labeled)
+            else:
+                # A control exists for this service, but no standard -- yours
+                # or otherwise -- has it as an ENABLED association by default.
+                # Enabling a standard won't help here; the control would need
+                # to be turned on directly, independent of any standard.
+                available_str = "No standard enables this control by default -- must be enabled directly"
 
         rows.append([svc, tagged_count, recorded, cfg_count, scanned, standards_str, gap_category, available_str])
     return rows
